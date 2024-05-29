@@ -1,0 +1,9 @@
+/.idea
+/app
+/build
+/demo
+/dist
+/resource
+/venv
+/yolov7.pt
+/__pycache__
