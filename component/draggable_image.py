@@ -1,23 +1,27 @@
+import string
 import threading
+import time
 
+import PIL.Image
+import PIL.Image
+import PIL.Image
+import PIL.Image
+import PIL.Image
+import PIL.Image
 import PIL.ImageOps
-import magicinpaint as mi
 import numpy
 import numpy as np
-import skimage.util
-from PIL import ImageDraw, ImageQt, Image
+from PIL import ImageDraw, Image
 from PIL.Image import Image
 from PyQt5 import QtGui
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QEvent, QPointF, QRectF
 from PyQt5.QtGui import QImage, QPainter, QColor
 from PyQt5.QtWidgets import QGridLayout, QAbstractScrollArea, QScrollArea
-from deoldify import device
-from deoldify.device_id import DeviceId
-from deoldify.visualize import *
+from pyinpaint import Inpaint
 from qfluentwidgets import SimpleCardWidget, ImageLabel
 from qfluentwidgets import SmoothScrollDelegate
 from rembg import remove
-from segment_anything import SamPredictor, sam_model_registry, SamAutomaticMaskGenerator
+import skimage
 from skimage.util import img_as_ubyte
 
 from common.command import Command, CommandMode
@@ -25,10 +29,17 @@ from common.config import cfg, FORMATTED_IMG_SUFFIX
 from common.icon import CursorIcon
 from common.quick_action import QuickAction, QuickActionMode
 from common.util import Util
-from lib.simple_lama_inpainting.model import SimpleLama
 
+from lib.simple_lama_inpainting.model import SimpleLama
 from yolov7_package import Yolov7Detector
-import cv2
+from segment_anything import SamPredictor
+from deoldify.visualize import *
+from skimage.metrics import structural_similarity
+
+import matplotlib
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 
 class ScrollArea(QScrollArea):
@@ -108,16 +119,18 @@ class DraggableImage(ScrollArea):
     zoomStep: float = 0.05
     zoomFactor: float = 1.0
 
-    # 模型加载器
-    imageColorizer: ModelImageVisualizer = None
-    videoColorizer: VideoColorizer = None
-    simpleLama: SimpleLama = None
-    maskGenerator: SamPredictor = None
-    autoMaskGenerator: SamAutomaticMaskGenerator = None
-    yolov7Detector: Yolov7Detector = None
+    imageColorizer: ModelImageVisualizer
+    simpleLama: SimpleLama
+    yolov7Detector: Yolov7Detector
+    samPredictor: SamPredictor
 
-    def __init__(self, parent=None):
+    def __init__(self, imageColorizer: ModelImageVisualizer, simpleLama: SimpleLama, maskGenerator: SamPredictor, yolov7Detector: Yolov7Detector, parent=None):
         super().__init__(parent)
+
+        self.imageColorizer = imageColorizer
+        self.simpleLama = simpleLama
+        self.samPredictor = maskGenerator
+        self.yolov7Detector = yolov7Detector
 
         self.imageLabel: ImageLabel = ImageLabel()
 
@@ -155,8 +168,10 @@ class DraggableImage(ScrollArea):
                 print(f'Converting file to .{FORMATTED_IMG_SUFFIX} format')
                 Image.open(path).save(self.imagePath)
             self.updateHistory(Image.open(self.imagePath))
+            self.getEntropy(self.getCurrentSnapshot())
             self.showCurrentSnapshotToUI()
-            self.onQuickActionBarClicked(QuickAction(QuickActionMode.SCALE_TO_WINDOW))
+            self.onQuickActionBarClicked(
+                QuickAction(QuickActionMode.SCALE_TO_WINDOW))
 
             self.setSpinnerEnabledSignal.emit(False)
 
@@ -258,8 +273,10 @@ class DraggableImage(ScrollArea):
             return
         sorted_anns = sorted(anns, key=(lambda x: x['area']), reverse=True)
 
-        img = np.ones((sorted_anns[0]['segmentation'].shape[0],
-                      sorted_anns[0]['segmentation'].shape[1], 4))
+        img = np.ones(
+            (
+                sorted_anns[0]['segmentation'].shape[0],
+                sorted_anns[0]['segmentation'].shape[1], 4))
         img[:, :, 3] = 0
         for ann in sorted_anns:
             m = ann['segmentation']
@@ -267,18 +284,18 @@ class DraggableImage(ScrollArea):
             img[m] = color_mask
         return Image.fromarray(img_as_ubyte(img))
 
-    def genMaskForPointRemove(self):
-        self.setSpinnerEnabledSignal.emit(True)
+    # def genMaskForPointRemove(self):
+    #     self.setSpinnerEnabledSignal.emit(True)
 
-        def task():
-            self.initAutoMaskGenerator()
-            masks = self.autoMaskGenerator.generate(
-                numpy.array(self.getCurrentSnapshot()))
-            self.updateHistory(self.getAnns(masks))
-            self.showCurrentSnapshotToUI()
-            self.setSpinnerEnabledSignal.emit(False)
+    #     def task():
+    #         self.initAutoMaskGenerator()
+    #         masks = self.autoMaskGenerator.generate(
+    #             numpy.array(self.getCurrentSnapshot()))
+    #         self.updateHistory(self.getAnns(masks))
+    #         self.showCurrentSnapshotToUI()
+    #         self.setSpinnerEnabledSignal.emit(False)
 
-        threading.Thread(target=task).start()
+    #     threading.Thread(target=task).start()
 
     def changeCursorIcon(self, cursorIcon: CursorIcon = None):
         Util.setCursor(
@@ -383,6 +400,18 @@ class DraggableImage(ScrollArea):
             self.getCurrentSnapshot().save(cacheFilePath)
         return cacheFilePath
 
+    def saveImageToCacheFolder(self, img: PIL.Image) -> str:
+        '''
+        保存图像至缓存区
+        :return: 返回一个值，指示保存文件的地址
+        '''
+        s = string.ascii_lowercase+string.digits
+        randomFileName = ''.join(random.sample(s, 10))
+        cacheFilePath: str = f'{cfg.cacheFolder.value}/{randomFileName}.png'
+        with open(cacheFilePath, 'wb'):
+            img.save(cacheFilePath)
+        return cacheFilePath
+
     def saveCurrentSnapshotToWorkFolder(self) -> bool:
         '''
         保存当前快照至工作区
@@ -420,74 +449,61 @@ class DraggableImage(ScrollArea):
         '''
         pathlib.Path.unlink(pathlib.Path(self.imagePath))
 
-    def initSimpleLama(self):
-        '''
-        初始化 SimpleLama 物体移除器
-        :return:
-        '''
-        if self.simpleLama is None:
-            print('Initializing SimpleLama')
-            self.simpleLama = SimpleLama()
-            print('SimpleLama initialized')
-
-    def initYOLOv7(self):
-        '''
-        初始化 YOLOv7 检测器
-        :return:
-        '''
-        if self.yolov7Detector is None:
-            print('Initializing YOLOv7')
-            self.yolov7Detector = Yolov7Detector(traced=False)
-            print('YOLOv7 initialized')
-
-    def initAutoMaskGenerator(self):
-        if self.autoMaskGenerator is None:
-            print('Initializing AutoMaskGenerator')
-            sam = sam_model_registry["default"](
-                checkpoint="./resource/models/sam_vit_h_4b8939.pth")
-            # sam.to(device="cuda")
-            sam.to(device="cpu")
-            self.autoMaskGenerator = SamAutomaticMaskGenerator(sam)
-            print('AutoMaskGenerator initialized')
-
-    def initSegmentPredictor(self):
-        if self.maskGenerator is None:
-            print('Initializing SegmentPredictor')
-            sam = sam_model_registry["default"](
-                checkpoint="./resource/models/sam_vit_h_4b8939.pth")
-            # sam.to(device="cuda")
-            sam.to(device="cpu")
-            self.maskGenerator = SamPredictor(sam)
-            print('SegmentPredictor initialized')
-
-    def initImageColorizer(self):
-        '''
-        初始化图片色彩化器
-        :return:
-        '''
-        # device.set(device=DeviceId.GPU0)
-        # torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.benchmark = False
-        self.imageColorizer = get_image_colorizer(
-            root_folder=Path('./resource/'), artistic=False)
-
-    def initVideoColorizer(self):
-        '''
-        初始化视频上色器
-        :return:
-        '''
-        torch.backends.cudnn.benchmark = False
-        self.videoColorizer = get_video_colorizer()
-
     def inpaint(self, orig: PIL.Image, mask: PIL.Image, useLama: bool = True) -> PIL.Image:
         if useLama:
-            self.initSimpleLama()
-            return self.simpleLama(orig.convert('RGB'), mask)
+            print('Inpainting using LaMa...')
+            start = time.time()
+            res: PIL.Image = self.simpleLama(orig.convert('RGB'), mask)
+            end = time.time()
+            print(f'Inpainting finished in {end - start} seconds')
+            return res
         else:
-            origArr: numpy.ndarray = np.array(orig)
-            mi.inpaint(origArr, np.array(mask), 15,
-                       mi.InpaintGPUfast, verbose=True)
-            return Image.fromarray(origArr)
+            inpaint = Inpaint(
+                org_img=self.saveImageToCacheFolder(orig),
+                mask=self.saveImageToCacheFolder(mask),
+                ps=3)
+            return Image.fromarray(inpaint(k_boundary=16, k_search=300, k_patch=3))
+
+    def rmBgUsingU2Net(self, origImg: PIL.Image, onlyMask: bool = True) -> PIL.Image:
+        additionalMsg: str = '(and generating mask) ' if onlyMask else ''
+        print(f'Removing background {additionalMsg}using U2Net...')
+        t = time.time()
+        mask: PIL.Image = remove(origImg, only_mask=onlyMask)
+        print(
+            f'Background removed {additionalMsg}in {time.time() - t} seconds')
+        return mask
+
+    def generateMaskBySam(
+            self,
+            origImg: PIL.Image,
+            point_coords: numpy.ndarray | None = None,
+            point_labels: numpy.ndarray | None = None,
+            box: numpy.ndarray | None = None) -> PIL.Image:
+        image = numpy.array(origImg)
+        print(f'Generating mask using SAM...')
+        start = time.time()
+        self.samPredictor.set_image(image)
+        masks, _, _ = self.samPredictor.predict(
+            point_coords=point_coords,
+            point_labels=point_labels,
+            box=box,
+            multimask_output=False
+        )
+        end = time.time()
+        print(f'Mask generated in {end - start} seconds')
+        mask = masks[0]
+        print('Expanding mask edge...')
+        start = time.time()
+        Util.expandMaskEdge(mask)
+        end = time.time()
+        print(f'Mask edge expanded in {end - start} seconds')
+        return Image.fromarray(mask)
+
+    def getEntropy(self, pilImg: PIL.Image) -> float:
+        entropy: float = skimage.measure.shannon_entropy(np.array(pilImg.convert('L')))
+        print(f'Entropy of image: {entropy}')
+        print(f'Pixel count: {pilImg.width * pilImg.height}')
+        return entropy
 
     def overlayColor(self):
         '''
@@ -527,7 +543,7 @@ class DraggableImage(ScrollArea):
 
     def purifyBg(self):
         origImg: PIL.Image = self.getCurrentSnapshot()
-        mask: PIL.Image = remove(origImg, only_mask=True)
+        mask: PIL.Image = self.rmBgUsingU2Net(origImg, True)
         self._maskToInpaint = mask
         self.updateHistory(self.inpaint(origImg, self._maskToInpaint))
         self.showCurrentSnapshotToUI()
@@ -538,30 +554,80 @@ class DraggableImage(ScrollArea):
         :return:
         '''
 
-        if self.imageColorizer is None:
-            self.initImageColorizer()
-        self.updateHistory(self.imageColorizer.get_transformed_image(
-            self.imageColorizer.plot_transformed_image(
-                self.saveCurrentSnapshotToCacheFolder(),
-                watermarked=False,
-                results_dir=Path(cfg.cacheFolder.value))))
+        origImg: PIL.Image = self.getCurrentSnapshot()
+
+        X = []
+
+        # 修正中文显示错误
+        plt.rcParams['font.sans-serif'] = ['Simhei']
+        # 在后台运行
+        matplotlib.use('agg')
+        plt.xlabel('渲染因子')
+        plt.ylabel('SSIM')
+
+        for factor in range(8, 42, 2):
+            img: PIL.Image = self.imageColorizer.get_transformed_image(
+                path=self.saveCurrentSnapshotToCacheFolder(),
+                render_factor=factor, # 默认 35
+                watermarked=False)
+            ssim: float = structural_similarity(
+                np.array(origImg), np.array(img), channel_axis=2)
+            X.append([ssim, factor])
+            print(f'SSIM: {ssim} at factor {factor}')
+
+        # 数据标准化
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(np.array(X))
+
+        # 计算不同聚类数的SSE
+        inertia = []
+        for k in range(1, 11):
+            kmeans = KMeans(n_clusters=k, random_state=42)
+            kmeans.fit(X_scaled)
+            inertia.append(kmeans.inertia_)
+
+        # 绘制手肘图
+        plt.figure(figsize=(8, 4))
+        plt.plot(range(1, 11), inertia, marker='o', linestyle='--')
+        plt.xlabel('聚类数')
+        plt.ylabel('SSE')
+        plt.grid(True)
+        plt.savefig('myplot.png')
+
+        # 人工观察
+        bestCluster = 2
+
+        kmeans = KMeans(n_clusters=bestCluster, random_state=42)
+        kmeans.fit(X)
+
+        # 获取质心
+        centroids = kmeans.cluster_centers_
+        bestFactor = 33 # centroids[bestCluster - 1][1]
+        print(f'Best SSIM founded with {centroids[bestCluster - 1][0]} at factor {centroids[bestCluster - 1][1]}')
+
+        bestImg = self.imageColorizer.get_transformed_image(
+                path=self.saveCurrentSnapshotToCacheFolder(),
+                render_factor=bestFactor,
+                watermarked=False)
+        self.updateHistory(bestImg)
         self.showCurrentSnapshotToUI()
         self.updateRedoUndoState()
 
-    def colorizeVideo(self):
-        '''
-        视频上色，使用 DeOldify
-        :return:
-        '''
-        # self.videoColorizer
-        pass
+    # def colorizeVideo(self):
+    #     '''
+    #     视频上色，使用 DeOldify
+    #     :return:
+    #     '''
+    #     # self.videoColorizer
+    #     pass
 
     def removeBg(self):
         '''
         移除背景
         '''
 
-        self.updateHistory(remove(self.getCurrentSnapshot()))
+        self.updateHistory(self.rmBgUsingU2Net(
+            self.getCurrentSnapshot(), False))
         self.showCurrentSnapshotToUI()
         self.updateRedoUndoState()
 
@@ -571,16 +637,14 @@ class DraggableImage(ScrollArea):
         :param prompt: 提示
         :return:
         '''
-        self.initYOLOv7()
         origImg: PIL.Image = self.getCurrentSnapshot()
         imageArr = np.array(origImg)
         classes, boxes, scores = self.yolov7Detector.detect(imageArr)
-        self.initSegmentPredictor()
-        self.maskGenerator.set_image(imageArr)
+        self.samPredictor.set_image(imageArr)
         inputBoxes = torch.tensor(boxes)
-        transformedBoxes = self.maskGenerator.transform.apply_boxes_torch(
+        transformedBoxes = self.samPredictor.transform.apply_boxes_torch(
             inputBoxes, imageArr.shape[:2])
-        masks, _, _ = self.maskGenerator.predict_torch(
+        masks, _, _ = self.samPredictor.predict_torch(
             point_coords=None,
             point_labels=None,
             boxes=transformedBoxes,
@@ -667,10 +731,11 @@ class DraggableImage(ScrollArea):
         )
         return (targetPos + qPointMoveDelta) / self.zoomFactor
 
-    def rebootPainter(self,
-                      penStyle: Qt.PenStyle = Qt.SolidLine,
-                      penColor: QColor = None,
-                      penWidthFactor: int = None):
+    def rebootPainter(
+            self,
+            penStyle: Qt.PenStyle = Qt.SolidLine,
+            penColor: QColor = None,
+            penWidthFactor: int = None):
         """
         重启画笔，将画笔绘制对象设置为当前快照的复制品
         :param penStyle: 画笔样式
@@ -714,8 +779,9 @@ class DraggableImage(ScrollArea):
             if event.button() == Qt.RightButton:
                 if self._command.mode == CommandMode.POINT_SELECT_REMOVE:
                     if self._isLeftBtnPressed:
-                        self.rebootPainter(penColor=QColor(Qt.red),
-                                           penWidthFactor=self._pointSelectPenWidthFactor)
+                        self.rebootPainter(
+                            penColor=QColor(Qt.red),
+                            penWidthFactor=self._pointSelectPenWidthFactor)
                         self._points.append(event.pos())
                         mappedPoints: list[QPointF] = list(
                             map(lambda point: self.mapToActualPoint(point), self._points))
@@ -735,10 +801,12 @@ class DraggableImage(ScrollArea):
                 if self._command.mode == CommandMode.DRAW:
                     self.rebootPainter()
                 elif self._command.mode == CommandMode.PAINT_SELECT_REMOVE:
-                    self.rebootPainter(penColor=QColor(Qt.black),
-                                       penWidthFactor=self._paintSelectPenWidthFactor)
-                    self._maskToInpaint = PIL.Image.new('L', (self.getCurrentSnapshot().size[0],
-                                                              self.getCurrentSnapshot().size[1]), 0)
+                    self.rebootPainter(
+                        penColor=QColor(Qt.black),
+                        penWidthFactor=self._paintSelectPenWidthFactor)
+                    self._maskToInpaint = PIL.Image.new('L', (
+                        self.getCurrentSnapshot().size[0],
+                        self.getCurrentSnapshot().size[1]), 0)
                 elif self._command.mode == CommandMode.DROPPER:
                     self.dropper(self.mapToActualPoint(self._startPos))
 
@@ -763,14 +831,16 @@ class DraggableImage(ScrollArea):
                 self.showDrawingToUI()
 
             elif self._command.mode == CommandMode.CROP:
-                self.rebootPainter(penStyle=Qt.DashLine,
-                                   penWidthFactor=self._cropPenWidthFactor)
+                self.rebootPainter(
+                    penStyle=Qt.DashLine,
+                    penWidthFactor=self._cropPenWidthFactor)
                 self._painter.drawRect(QRectF(mappedStartPos, mappedCurPos))
                 self.showDrawingToUI()
 
             elif self._command.mode == CommandMode.RECTANGLE_SELECT_REMOVE:
-                self.rebootPainter(penColor=QColor(Qt.black),
-                                   penWidthFactor=self._rectSelectPenWidthFactor)
+                self.rebootPainter(
+                    penColor=QColor(Qt.black),
+                    penWidthFactor=self._rectSelectPenWidthFactor)
                 self._painter.drawRect(QRectF(mappedStartPos, mappedCurPos))
                 self.showDrawingToUI()
 
@@ -822,44 +892,36 @@ class DraggableImage(ScrollArea):
                     self._isMoveMode = False
 
                 elif self._command.mode == CommandMode.CROP:
-                    imageToUpdate = origImg.crop((mappedTopLeftPos.x(),
-                                                  mappedTopLeftPos.y(),
-                                                  mappedBottomRightPos.x(),
-                                                  mappedBottomRightPos.y()))
+                    imageToUpdate = origImg.crop((
+                        mappedTopLeftPos.x(),
+                        mappedTopLeftPos.y(),
+                        mappedBottomRightPos.x(),
+                        mappedBottomRightPos.y()))
 
                 elif self._command.mode == CommandMode.RECTANGLE_SELECT_REMOVE:
-                    self.initSegmentPredictor()
-                    image = np.array(origImg)
-                    self.maskGenerator.set_image(image)
-                    inputBox = np.array([mappedTopLeftPos.x(),
-                                         mappedTopLeftPos.y(),
-                                         mappedBottomRightPos.x(),
-                                         mappedBottomRightPos.y()])
-                    masks, _, _ = self.maskGenerator.predict(
-                        box=inputBox[None, :],
-                        multimask_output=False
+                    inputBox = np.array([
+                        mappedTopLeftPos.x(),
+                        mappedTopLeftPos.y(),
+                        mappedBottomRightPos.x(),
+                        mappedBottomRightPos.y()])
+                    mask = self.generateMaskBySam(
+                        origImg=origImg,
+                        box=inputBox[None, :]
                     )
-                    mask = masks[0]
-                    Util.expandMaskEdge(mask)
-                    self._maskToInpaint = Image.fromarray(mask)
+                    self._maskToInpaint = mask
                     imageToUpdate = self.inpaint(origImg, self._maskToInpaint)
 
                 elif self._command.mode == CommandMode.POINT_SELECT_REMOVE:
                     if not self._isLeftBtnPressed:
-                        self.initSegmentPredictor()
-                        image = numpy.array(origImg)
-                        self.maskGenerator.set_image(image)
                         inputPoint = np.array(
                             [[pos.x(), pos.y()] for pos in mappedPoints])
                         inputLabel = np.array([1 for _ in mappedPoints])
-                        masks, _, _ = self.maskGenerator.predict(
+                        mask = self.generateMaskBySam(
+                            origImg=origImg,
                             point_coords=inputPoint,
-                            point_labels=inputLabel,
-                            multimask_output=False
+                            point_labels=inputLabel
                         )
-                        mask = masks[0]
-                        Util.expandMaskEdge(mask)
-                        self._maskToInpaint = Image.fromarray(mask)
+                        self._maskToInpaint = mask
                         imageToUpdate = self.inpaint(
                             origImg, self._maskToInpaint)
 

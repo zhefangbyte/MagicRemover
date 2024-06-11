@@ -7,11 +7,11 @@ from PyQt5.QtGui import QImage
 from PyQt5.QtWidgets import QWidget, QGridLayout
 from qfluentwidgets import BodyLabel, SubtitleLabel, ImageLabel, FlowLayout, PrimaryPushButton, LineEdit, InfoBar, \
     CardWidget
+from deoldify.visualize import *
 
 from common.config import cfg, FORMATTED_IMG_SUFFIX
 from common.util import Util
 from component.scrollable_interface import ScrollableInterface
-
 
 class HomeInterface(ScrollableInterface):
     """ Home interface """

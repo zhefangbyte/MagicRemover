@@ -36,8 +36,8 @@ class Util:
         response: requests.Response = requests.get(url)
         targetFilePath = \
             f'{cfg.cacheFolder.value}/{os.path.basename(urlparse(url).path)}.{FORMATTED_IMG_SUFFIX}' \
-                if targetFilePath is None \
-                else targetFilePath
+            if targetFilePath is None \
+            else targetFilePath
         print(f'Saving image to {targetFilePath}')
         with open(targetFilePath, "wb") as file:
             file.write(response.content)
@@ -51,7 +51,8 @@ class Util:
     @staticmethod
     def setModernTooltipText(qWidget: QWidget, text: str):
         qWidget.setToolTip(text)
-        qWidget.installEventFilter(ToolTipFilter(qWidget, 0, ToolTipPosition.TOP))
+        qWidget.installEventFilter(
+            ToolTipFilter(qWidget, 0, ToolTipPosition.TOP))
 
     @staticmethod
     def fixTPBStyle(tpb: TransparentPushButton):
@@ -95,23 +96,27 @@ class Util:
 
     @staticmethod
     def expandMaskEdge(image: ndarray):
-        whitePixels: list[tuple[int, int]] = []
+        edgePixels: list[tuple[int, int]] = []
 
         width: int = image.shape[0]
         height: int = image.shape[1]
 
         for x in range(width):
             for y in range(height):
-                if image[x][y] == True:
-                    whitePixels.append((x, y))
+                if image[x][y] == True and ((x - 1 >= 0 and image[x - 1][y] == False) or
+                                            (x + 1 < width and image[x + 1][y] == False) or
+                                            (y - 1 >= 0 and image[x][y - 1] == False) or
+                                            (y + 1 < height and image[x][y + 1] == False)):
+                    edgePixels.append((x, y))
 
         expandPixelSize: int = 10
 
-        for pixel in whitePixels:
+        for pixel in edgePixels:
             for x in range(pixel[0] - expandPixelSize, pixel[0] + expandPixelSize + 1):
                 for y in range(pixel[1] - expandPixelSize, pixel[1] + expandPixelSize + 1):
                     if 0 <= x < width and 0 <= y < height:
-                        radius: float = math.sqrt((x - pixel[0]) ** 2 + (y - pixel[1]) ** 2)
+                        radius: float = math.sqrt(
+                            (x - pixel[0]) ** 2 + (y - pixel[1]) ** 2)
                         if radius <= expandPixelSize:
                             image[x][y] = True
 
