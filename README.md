@@ -3,7 +3,7 @@ This is a graduate project for my undergraduate study.
 
 It aims to build an app that can be used to colour and repair images. Also, it includes some basic functions that an image editor will do.
 
-See the brief intro video via [Bilibili](https://www.bilibili.com/video/BV13m421W7Zr/) in Chinese or [YouTube](will be published later) in English.
+See the brief intro video via [Bilibili](https://www.bilibili.com/video/BV13m421W7Zr/) in Chinese or [YouTube](https://www.youtube.com/watch?v=j_cjcSy7R-w) in English.
 
 # Development
 By default, this project uses PyTorch packages with CPU versions, 
